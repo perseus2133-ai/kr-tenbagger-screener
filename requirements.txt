@@ -1,4 +1,4 @@
-setuptools>=68
+setuptools>=68,<81
 streamlit>=1.32
 pandas>=2.1
 numpy>=1.26
