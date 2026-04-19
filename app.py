@@ -6,7 +6,6 @@
 import re
 from datetime import datetime, timedelta
 
-import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import streamlit as st
@@ -19,7 +18,7 @@ st.set_page_config(page_title="텐배거 후보 스크리너", layout="wide", pa
 # ────────────────────────── 데이터 수집 ──────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_listings_with_cap() -> pd.DataFrame:
-    """KRX 전체 상장 종목 + 당일(영업일) 시가총액."""
+    """KRX 전체 상장 종목 + 당일(영업일) 시가총액 (pykrx 단독)."""
     day = datetime.today()
     df_kospi = df_kosdaq = pd.DataFrame()
     # 휴장일 보정: 최근 7영업일까지 역순 시도
@@ -41,13 +40,19 @@ def get_listings_with_cap() -> pd.DataFrame:
         .reset_index()
         .rename(columns={"티커": "Code", "시가총액": "MarketCap"})
     )
+    # 이름은 필터링 후 필요한 종목에 대해서만 조회 (성능)
+    cap["Name"] = cap["Code"]
+    return cap[["Code", "Name", "Market", "MarketCap"]]
 
-    names = pd.concat(
-        [fdr.StockListing("KOSPI")[["Code", "Name"]],
-         fdr.StockListing("KOSDAQ")[["Code", "Name"]]],
-        ignore_index=True,
-    )
-    return cap.merge(names, on="Code", how="left")[["Code", "Name", "Market", "MarketCap"]]
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_ticker_name(code: str) -> str:
+    """pykrx로 종목명 조회 (실패 시 티커 그대로 반환)."""
+    try:
+        name = stock.get_market_ticker_name(code)
+        return name if name else code
+    except Exception:
+        return code
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -142,7 +147,8 @@ st.info(f"전체 {len(listings):,}개 → 시총 {cap_max}조 미만 {len(small_
 progress = st.progress(0.0, text="재무 데이터 수집 중...")
 records = []
 for i, row in enumerate(target.itertuples(index=False), 1):
-    progress.progress(i / len(target), text=f"{i}/{len(target)} · {row.Name}")
+    name = get_ticker_name(row.Code)
+    progress.progress(i / len(target), text=f"{i}/{len(target)} · {name}")
     fin = get_financial_history(row.Code)
     if not fin:
         continue
@@ -160,7 +166,7 @@ for i, row in enumerate(target.itertuples(index=False), 1):
 
     records.append({
         "종목코드": row.Code,
-        "종목명": row.Name,
+        "종목명": name,
         "시장": row.Market,
         "시총(억)": round(row.MarketCap / 1e8),
         f"매출({base_label}E,억)": round(rev_base),

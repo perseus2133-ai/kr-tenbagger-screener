@@ -2,7 +2,6 @@ setuptools>=68,<81
 streamlit>=1.32
 pandas>=2.1
 numpy>=1.26
-finance-datareader>=0.9.50
 pykrx>=1.0.45
 requests>=2.31
 beautifulsoup4>=4.12
