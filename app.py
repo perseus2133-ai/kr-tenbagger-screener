@@ -1,72 +1,83 @@
 """
 텐배거 후보 스크리너 (KOSPI/KOSDAQ)
-- 시총 < 1조, 최근 3년 CAGR 기반 2028E 영업이익 ≥ 2,000억,
+- 시총 < 1조, 최근 3년 CAGR 기반 3년 뒤 영업이익 ≥ 2,000억,
   매출/영업이익이 기준연도 대비 2배 이상 성장 예상 종목 필터링.
+- 데이터 소스: 네이버 금융 (시총 페이지 + 기업실적분석 페이지)
 """
 import re
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from pykrx import stock
 
 st.set_page_config(page_title="텐배거 후보 스크리너", layout="wide", page_icon="📈")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+}
 
 
 # ────────────────────────── 데이터 수집 ──────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_listings_with_cap() -> pd.DataFrame:
-    """KRX 전체 상장 종목 + 당일(영업일) 시가총액 (pykrx 단독)."""
-    day = datetime.today()
-    df_kospi = df_kosdaq = pd.DataFrame()
-    # 휴장일 보정: 최근 7영업일까지 역순 시도
-    for _ in range(7):
-        ymd = day.strftime("%Y%m%d")
-        try:
-            df_kospi = stock.get_market_cap_by_ticker(ymd, market="KOSPI")
-            df_kosdaq = stock.get_market_cap_by_ticker(ymd, market="KOSDAQ")
-            if not df_kospi.empty:
+    """네이버 금융 '시가총액' 페이지를 순회하며 KOSPI+KOSDAQ 전체 종목을 수집."""
+    rows = []
+    # sosok 0=KOSPI, 1=KOSDAQ
+    for market_name, sosok in [("KOSPI", 0), ("KOSDAQ", 1)]:
+        for page in range(1, 50):
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                trs = soup.select("table.type_2 tbody tr")
+                page_count = 0
+                for tr in trs:
+                    a = tr.select_one("a.tltle")
+                    if not a:
+                        continue
+                    m = re.search(r"code=(\d{6})", a.get("href", ""))
+                    if not m:
+                        continue
+                    tds = tr.select("td")
+                    if len(tds) < 7:
+                        continue
+                    cap_text = tds[6].get_text(strip=True).replace(",", "")
+                    if not cap_text.isdigit():
+                        continue
+                    rows.append({
+                        "Code": m.group(1),
+                        "Name": a.get_text(strip=True),
+                        "Market": market_name,
+                        "MarketCap": int(cap_text) * 100_000_000,  # 억원 → 원
+                    })
+                    page_count += 1
+                if page_count == 0:
+                    break  # 더 이상 페이지 없음
+            except Exception:
                 break
-        except Exception:
-            pass
-        day -= timedelta(days=1)
-
-    df_kospi["Market"] = "KOSPI"
-    df_kosdaq["Market"] = "KOSDAQ"
-    cap = (
-        pd.concat([df_kospi, df_kosdaq])
-        .reset_index()
-        .rename(columns={"티커": "Code", "시가총액": "MarketCap"})
-    )
-    # 이름은 필터링 후 필요한 종목에 대해서만 조회 (성능)
-    cap["Name"] = cap["Code"]
-    return cap[["Code", "Name", "Market", "MarketCap"]]
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_ticker_name(code: str) -> str:
-    """pykrx로 종목명 조회 (실패 시 티커 그대로 반환)."""
-    try:
-        name = stock.get_market_ticker_name(code)
-        return name if name else code
-    except Exception:
-        return code
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.drop_duplicates(subset=["Code"]).reset_index(drop=True)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_financial_history(code: str):
-    """네이버 금융 '기업실적분석' 표에서 최근 연간 매출/영업이익 추출 (단위: 억원)."""
+    """네이버 금융 '기업실적분석'에서 최근 연간 매출/영업이익 추출 (단위: 억원)."""
     url = f"https://finance.naver.com/item/main.naver?code={code}"
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         soup = BeautifulSoup(r.text, "html.parser")
         table = soup.select_one("div.section.cop_analysis table")
         if table is None:
             return None
 
-        # 연간 컬럼만 식별 (예: 2022.12, 2023.12, 2024.12, 2025.12(E))
         headers_txt = [th.get_text(strip=True) for th in table.select("thead th")]
         year_idx = [i for i, h in enumerate(headers_txt) if re.match(r"\d{4}\.\d{2}", h)][:4]
 
@@ -82,7 +93,6 @@ def get_financial_history(code: str):
         def pick(label):
             vals = []
             for i in year_idx:
-                # tbody td는 헤더 첫 칸(th)을 제외 → 인덱스 보정
                 data_i = i - 1 if len(headers_txt) > len(rows.get(label, [])) else i
                 try:
                     v = rows[label][data_i]
@@ -136,8 +146,12 @@ if not run:
     st.info("👈 사이드바에서 조건을 설정한 뒤 '스크리닝 실행'을 눌러주세요.")
     st.stop()
 
-with st.spinner("KRX 시가총액 수집 중..."):
+with st.spinner("네이버 금융에서 종목·시총 수집 중... (최초 1~2분)"):
     listings = get_listings_with_cap()
+
+if listings.empty:
+    st.error("❌ 종목 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
+    st.stop()
 
 cap_thresh = cap_max * 1e12
 small_caps = listings[listings["MarketCap"] < cap_thresh].copy()
@@ -147,8 +161,7 @@ st.info(f"전체 {len(listings):,}개 → 시총 {cap_max}조 미만 {len(small_
 progress = st.progress(0.0, text="재무 데이터 수집 중...")
 records = []
 for i, row in enumerate(target.itertuples(index=False), 1):
-    name = get_ticker_name(row.Code)
-    progress.progress(i / len(target), text=f"{i}/{len(target)} · {name}")
+    progress.progress(i / len(target), text=f"{i}/{len(target)} · {row.Name}")
     fin = get_financial_history(row.Code)
     if not fin:
         continue
@@ -166,7 +179,7 @@ for i, row in enumerate(target.itertuples(index=False), 1):
 
     records.append({
         "종목코드": row.Code,
-        "종목명": name,
+        "종목명": row.Name,
         "시장": row.Market,
         "시총(억)": round(row.MarketCap / 1e8),
         f"매출({base_label}E,억)": round(rev_base),
